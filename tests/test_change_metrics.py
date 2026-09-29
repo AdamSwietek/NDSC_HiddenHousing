@@ -2,9 +2,10 @@ import unittest
 
 import geopandas as gpd
 from shapely import affinity
-from shapely.geometry import box
+from shapely.geometry import Polygon, box
 
 from src.change_metrics import (
+    _difference_series,
     calculate_change_metrics,
     estimate_epoch_shift,
     prepare_epoch_footprints,
@@ -48,6 +49,32 @@ class SliverRemovalTests(unittest.TestCase):
         self.assertAlmostEqual(cleaned.area, building.area, places=6)
         self.assertTrue(cleaned.equals(building))
         self.assertEqual(len(cleaned.exterior.coords), 5)
+
+    def test_difference_repairs_topology_error(self):
+        invalid_bowtie = Polygon([
+            (0, 0), (2, 2), (0, 2), (2, 0), (0, 0),
+        ])
+        left = gpd.GeoSeries([invalid_bowtie], crs=CRS)
+        right = gpd.GeoSeries([box(0, 0, 1, 2)], crs=CRS)
+
+        result = _difference_series(left, right)
+
+        self.assertTrue(result.iloc[0].is_valid)
+        self.assertAlmostEqual(result.iloc[0].area, 1.0)
+
+    def test_difference_extracts_polygon_from_mixed_dimension_repair(self):
+        polygon_with_line_spike = Polygon([
+            (0, 0), (2, 0), (2, 2), (1, 2),
+            (1, 3), (1, 2), (0, 2), (0, 0),
+        ])
+        left = gpd.GeoSeries([polygon_with_line_spike], crs=CRS)
+        right = gpd.GeoSeries([box(0, 0, 1, 3)], crs=CRS)
+
+        result = _difference_series(left, right)
+
+        self.assertTrue(result.iloc[0].is_valid)
+        self.assertIn(result.iloc[0].geom_type, ('Polygon', 'MultiPolygon'))
+        self.assertAlmostEqual(result.iloc[0].area, 2.0)
 
 
 class ChangeMetricsTests(unittest.TestCase):

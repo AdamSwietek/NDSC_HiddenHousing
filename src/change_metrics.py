@@ -7,6 +7,8 @@ from typing import Optional
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import shapely
+from shapely.errors import GEOSException
 
 try:
     from .lariac_cleaning import repair_boundary_fragments
@@ -22,6 +24,7 @@ DEFAULT_CHANGE_CRS = 'EPSG:26911'
 DEFAULT_SLIVER_BUFFER_M = 0.4
 DEFAULT_MIN_CHANGE_AREA_M2 = 2.0
 DEFAULT_RELATIVE_CHANGE = 0.02
+TOPOLOGY_GRID_SIZE_M = 1e-6
 
 
 def prepare_epoch_footprints(
@@ -600,11 +603,72 @@ def _difference_series(left, right):
     valid = _present_geometry(left)
     valid_right = _present_geometry(right)
     both = valid & valid_right
-    result.loc[both] = left.loc[both].difference(
-        right.loc[both], align=False
-    ).to_numpy()
+    if both.any():
+        left_both = left.loc[both]
+        right_both = right.loc[both]
+        try:
+            differences = left_both.difference(right_both, align=False).to_numpy()
+        except GEOSException:
+            # Overlay can fail on otherwise usable LARIAC polygons when
+            # nearly coincident boundary segments are not fully noded.
+            # ``make_valid`` can return polygon-plus-line collections, which
+            # fixed-precision overlay rejects as mixed-dimension input. Keep
+            # only polygonal components because these metrics measure area,
+            # then snap at a micrometre grid for consistent topology.
+            repaired_left = np.array(
+                [_polygonal_make_valid(geometry) for geometry in left_both],
+                dtype=object,
+            )
+            repaired_right = np.array(
+                [_polygonal_make_valid(geometry) for geometry in right_both],
+                dtype=object,
+            )
+            try:
+                differences = shapely.difference(
+                    repaired_left,
+                    repaired_right,
+                    grid_size=TOPOLOGY_GRID_SIZE_M,
+                )
+            except GEOSException:
+                differences = np.array([
+                    _precision_difference(left_geometry, right_geometry)
+                    for left_geometry, right_geometry
+                    in zip(repaired_left, repaired_right)
+                ], dtype=object)
+        result.loc[both] = differences
     result.loc[valid & ~valid_right] = left.loc[valid & ~valid_right].to_numpy()
     return result
+
+
+def _polygonal_make_valid(geometry):
+    """Repair a geometry and discard non-area components recursively."""
+    repaired = shapely.make_valid(geometry)
+    polygons = []
+    pending = [repaired]
+    while pending:
+        current = pending.pop()
+        if current is None or current.is_empty:
+            continue
+        if current.geom_type == 'Polygon':
+            polygons.append(current)
+        elif current.geom_type in ('MultiPolygon', 'GeometryCollection'):
+            pending.extend(current.geoms)
+    if not polygons:
+        return shapely.GeometryCollection()
+    if len(polygons) == 1:
+        return polygons[0]
+    return shapely.union_all(polygons)
+
+
+def _precision_difference(left, right):
+    """Retry one polygonal difference at increasingly coarse fine grids."""
+    error = None
+    for grid_size in (TOPOLOGY_GRID_SIZE_M, 1e-4, 1e-3):
+        try:
+            return shapely.difference(left, right, grid_size=grid_size)
+        except GEOSException as caught:
+            error = caught
+    raise error
 
 
 def _reindex_building_count(frame, index):

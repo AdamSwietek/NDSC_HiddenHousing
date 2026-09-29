@@ -41,6 +41,8 @@ class ProcessingTile:
     row: int
     core: object
     halo: object
+    # Digest of the halo when split-site closure widened it; None otherwise.
+    site_closure: str | None = None
 
 
 @dataclass(frozen=True)
@@ -204,8 +206,16 @@ def run_tiled_feature_pipeline(
     city_projected = aoi.to_crs(grid.crs).geometry.union_all()
     for tile in tiles:
         tile_path = tile_root / tile.tile_id
-        if (tile_path / 'manifest.json').exists():
-            continue
+        manifest_path = tile_path / 'manifest.json'
+        if manifest_path.exists():
+            stored = json.loads(manifest_path.read_text()).get('parameters', {})
+            if stored.get('site_closure') == tile.site_closure:
+                continue
+            # The halo now differs from the one this checkpoint was built with.
+            shutil.rmtree(tile_path)
+        tile_parameters = {**configuration, 'tile_id': tile.tile_id}
+        if tile.site_closure is not None:
+            tile_parameters['site_closure'] = tile.site_closure
         halo_aoi = gpd.GeoDataFrame(
             {'tile_id': [tile.tile_id]}, geometry=[tile.halo], crs=grid.crs
         ).to_crs('EPSG:4326')
@@ -226,7 +236,7 @@ def run_tiled_feature_pipeline(
             tile_root,
             tile.tile_id,
             aoi_wgs84=halo_aoi.total_bounds,
-            parameters={**configuration, 'tile_id': tile.tile_id},
+            parameters=tile_parameters,
             write_change_geometries=write_change_geometries,
         )
 
@@ -250,11 +260,17 @@ def _expand_tiles_to_owned_parcels(
     assessor_parcel_years,
     halo_feet,
 ):
-    """Ensure each tile halo contains the full extent of every owned parcel."""
+    """Ensure each tile halo contains the full extent of every owned parcel.
+
+    Halos are then closed over multi-polygon sites: a tile that loads any part
+    of a site also loads every other part, so each tile dissolves the same site
+    geometry and exactly one tile claims it.
+    """
     city = aoi.to_crs(grid.crs).geometry.union_all()
     halo_m = float(halo_feet) * METRES_PER_FOOT
     bounds_by_tile = {tile.tile_id: [] for tile in tiles}
     assessor_ains = []
+    multipart_sites = []
     tile_lookup = {(tile.column, tile.row): tile.tile_id for tile in tiles}
     for year in sorted(parcel_years):
         parcels = load_parcel_polygons(
@@ -266,6 +282,11 @@ def _expand_tiles_to_owned_parcels(
         )
         if year in assessor_parcel_years:
             assessor_ains.extend(parcels['AIN'].dropna().tolist())
+        multipart_sites.append(
+            parcels.loc[
+                parcels['site_id'].duplicated(keep=False), ['site_id', 'geometry']
+            ]
+        )
         clipped = parcels.geometry.intersection(city)
         present = pd.Series(
             ~pd.isna(clipped.array), index=clipped.index
@@ -287,16 +308,56 @@ def _expand_tiles_to_owned_parcels(
                 parcels.loc[list(indices)].total_bounds
             )
 
+    site_parts = gpd.GeoDataFrame(
+        pd.concat(multipart_sites, ignore_index=True),
+        geometry='geometry', crs=grid.crs,
+    )
     expanded = []
     for tile in tiles:
         halo = tile.halo
         for minx, miny, maxx, maxy in bounds_by_tile[tile.tile_id]:
             parcel_envelope = shapely.box(minx, miny, maxx, maxy).buffer(halo_m)
             halo = halo.union(parcel_envelope)
-        expanded.append(
-            ProcessingTile(tile.tile_id, tile.column, tile.row, tile.core, halo)
-        )
+        closed = _close_halo_over_split_sites(halo, site_parts, halo_m)
+        digest = None
+        if not closed.equals(halo):
+            digest = hashlib.sha1(shapely.normalize(closed).wkb).hexdigest()[:16]
+        expanded.append(ProcessingTile(
+            tile.tile_id, tile.column, tile.row, tile.core, closed, digest
+        ))
     return expanded, assessor_ains
+
+
+# Parts this close to the halo edge may or may not load after reprojection.
+SPLIT_SITE_EDGE_TOLERANCE_M = 1.0
+
+
+def _close_halo_over_split_sites(halo, site_parts, halo_m):
+    """Widen ``halo`` until it loads every part of each site it touches.
+
+    ``site_parts`` holds one row per polygon for sites with several polygons.
+    A part counts as loaded only if it reaches well inside the halo; any part
+    of a touched site that does not is added with a ``halo_m`` buffer so its
+    buildings load too. Repeats until no touched site is missing a part.
+    """
+    if site_parts.empty:
+        return halo
+    index = site_parts.sindex
+    while True:
+        reach = halo.buffer(SPLIT_SITE_EDGE_TOLERANCE_M)
+        touched = site_parts.iloc[index.query(reach, predicate='intersects')]
+        if touched.empty:
+            return halo
+        parts = site_parts.loc[site_parts['site_id'].isin(touched['site_id'])]
+        loaded = parts.intersects(halo.buffer(-SPLIT_SITE_EDGE_TOLERANCE_M))
+        missing = parts.loc[~loaded]
+        if missing.empty:
+            return halo
+        additions = [
+            shapely.box(*bounds).buffer(halo_m)
+            for bounds in missing.geometry.bounds.to_numpy()
+        ]
+        halo = shapely.union_all([halo, *additions])
 
 
 def _load_or_estimate_alignments(

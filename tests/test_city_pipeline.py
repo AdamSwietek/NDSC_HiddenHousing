@@ -5,6 +5,7 @@ import pandas as pd
 from shapely.geometry import box
 
 from src.city_pipeline import (
+    _close_halo_over_split_sites,
     _disambiguate_reused_structure_ids,
     _normalize_output_identifier_types,
     _require_full_lariac_coverage,
@@ -69,6 +70,54 @@ class CityPipelineTests(unittest.TestCase):
 
         self.assertTrue(result['structure_id'].is_unique)
         self.assertTrue(result['structure_id'].str.startswith('7~').all())
+
+    def test_halo_closes_over_distant_part_of_split_site(self):
+        # One site split into a main parcel inside the halo and a sliver far
+        # outside it, plus a far multipart site the halo never touches.
+        site_parts = gpd.GeoDataFrame(
+            {'site_id': ['ain:1', 'ain:1', 'ain:2', 'ain:2']},
+            geometry=[
+                box(10, 10, 20, 20), box(2000, 2000, 2005, 2005),
+                box(5000, 0, 5010, 10), box(5020, 0, 5030, 10),
+            ],
+            crs='EPSG:26911',
+        )
+        halo = box(0, 0, 100, 100)
+
+        closed = _close_halo_over_split_sites(halo, site_parts, halo_m=150)
+
+        self.assertTrue(closed.contains(site_parts.geometry.iloc[1].buffer(150)))
+        self.assertFalse(closed.intersects(site_parts.geometry.iloc[2]))
+
+    def test_closure_follows_chains_of_split_sites(self):
+        # Loading site 1's far part brings in site 2, whose other part is
+        # farther still; both must end up inside the halo.
+        site_parts = gpd.GeoDataFrame(
+            {'site_id': ['ain:1', 'ain:1', 'ain:2', 'ain:2']},
+            geometry=[
+                box(10, 10, 20, 20), box(2000, 0, 2005, 5),
+                box(2100, 0, 2110, 10), box(9000, 0, 9010, 10),
+            ],
+            crs='EPSG:26911',
+        )
+
+        closed = _close_halo_over_split_sites(
+            box(0, 0, 100, 100), site_parts, halo_m=150
+        )
+
+        self.assertTrue(site_parts.geometry.within(closed).all())
+
+    def test_halo_unchanged_when_split_sites_already_loaded(self):
+        site_parts = gpd.GeoDataFrame(
+            {'site_id': ['ain:1', 'ain:1']},
+            geometry=[box(10, 10, 20, 20), box(40, 40, 50, 50)],
+            crs='EPSG:26911',
+        )
+        halo = box(0, 0, 100, 100)
+
+        closed = _close_halo_over_split_sites(halo, site_parts, halo_m=150)
+
+        self.assertTrue(closed.equals(halo))
 
 
 if __name__ == '__main__':
